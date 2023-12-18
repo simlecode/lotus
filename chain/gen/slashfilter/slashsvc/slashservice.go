@@ -2,6 +2,7 @@ package slashsvc
 
 import (
 	"context"
+	"math/rand"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -12,10 +13,13 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	cborutil "github.com/filecoin-project/go-cbor-util"
+	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/builtin"
+	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/specs-actors/actors/builtin/miner"
 
 	lapi "github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/lotus/api/client"
 	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/gen/slashfilter"
 	"github.com/filecoin-project/lotus/chain/types"
@@ -29,10 +33,12 @@ type ConsensusSlasherApi interface {
 	MpoolPushMessage(ctx context.Context, msg *types.Message, spec *lapi.MessageSendSpec) (*types.SignedMessage, error)
 	SyncIncomingBlocks(context.Context) (<-chan *types.BlockHeader, error)
 	WalletDefaultAddress(context.Context) (address.Address, error)
+	WalletSign(ctx context.Context, k address.Address, msg []byte) (*crypto.Signature, error)
 }
 
 func SlashConsensus(ctx context.Context, a ConsensusSlasherApi, p string, from string) error {
 	var fromAddr address.Address
+	slashBlocks := make(map[cid.Cid]*types.BlockHeader)
 
 	ds, err := levelds.NewDatastore(p, &levelds.Options{
 		Compression: ldbopts.NoCompression,
@@ -73,7 +79,7 @@ func SlashConsensus(ctx context.Context, a ConsensusSlasherApi, p string, from s
 				continue
 			}
 			if fault {
-				log.Errorf("<!!> SLASH FILTER DETECTED FAULT DUE TO BLOCKS %s and %s", otherBlock.Cid(), block.Cid())
+				log.Errorf("<!!> SLASH FILTER DETECTED FAULT DUE TO BLOCKS %s and %s, height: %d", otherBlock.Cid(), block.Cid(), otherBlock.Height)
 				bh1, err := cborutil.Dump(otherBlock)
 				if err != nil {
 					log.Errorf("could not dump otherblock:%s, err:%s", otherBlock.Cid(), err)
@@ -104,29 +110,85 @@ func SlashConsensus(ctx context.Context, a ConsensusSlasherApi, p string, from s
 					log.Errorf("could not serialize declare faults parameters: %s", err)
 					continue
 				}
-				for {
-					head, err := a.ChainHead(ctx)
-					if err != nil || head.Height() > block.Height {
-						break
-					}
-					time.Sleep(time.Second * 10)
+
+				if _, ok := slashBlocks[block.Cid()]; ok {
+					log.Infof("ReportConsensusFault %s already reported", block.Cid())
+					continue
 				}
-				message, err := a.MpoolPushMessage(ctx, &types.Message{
+				slashBlocks[block.Cid()] = block
+				slashBlocks[otherBlock.Cid()] = otherBlock
+
+				msg := &types.Message{
 					To:     block.Miner,
 					From:   fromAddr,
 					Value:  types.NewInt(0),
 					Method: builtin.MethodsMiner.ReportConsensusFault,
 					Params: enc,
-				}, nil)
-				if err != nil {
-					log.Errorf("ReportConsensusFault to messagepool error:%s", err)
-					continue
 				}
-				log.Infof("ReportConsensusFault message CID:%s", message.Cid())
 
+				go waitPushMessage(ctx, a, msg, block.Height)
 			}
 		}
 	}()
+
+	return nil
+}
+
+func waitPushMessage(ctx context.Context, a ConsensusSlasherApi, msg *types.Message, slashHeight abi.ChainEpoch) error {
+	otherAPI, closer, err := client.NewFullNodeRPCV0(ctx, "https://api.node.glif.io/rpc/v0", nil)
+	if err != nil {
+		log.Warnf("ReportConsensusFault connect other node error: %s", err)
+	}
+	if closer != nil {
+		defer closer()
+	}
+
+	head, err := a.ChainHead(ctx)
+	if err != nil {
+		return err
+	}
+
+	maxWait := 12
+	blkTime := time.Now().Unix() - int64(head.MinTimestamp())
+	wait := maxWait - int(blkTime)
+	if wait > 0 {
+		time.Sleep(time.Duration(wait) * time.Second)
+	}
+
+	{
+		tmpMsg := types.Message{}
+		tmpMsg = *msg
+		tmpMsg.GasLimit = int64(50923829 + rand.Int63n(10000000))
+		tmpMsg.GasFeeCap = abi.NewTokenAmount(5000000)
+		tmpMsg.GasPremium = abi.NewTokenAmount(4200000 + rand.Int63n(10000))
+		msgCid, err := signAndPushMessage(ctx, otherAPI, func(ctx context.Context, signer address.Address, toSign []byte, meta lapi.MsgMeta) (*crypto.Signature, error) {
+			return a.WalletSign(ctx, signer, toSign)
+		}, &tmpMsg, 1, false, true)
+		if err != nil {
+			log.Warnf("ReportConsensusFault to messagepool failed: error:%s", err)
+		} else {
+			log.Infof("ReportConsensusFault push message success: CID:%s \n", msgCid)
+
+			go func() {
+				log.Infof("try replace message")
+				_, err = tryReplaceMsg(ctx, otherAPI, a.WalletSign, tmpMsg)
+				if err != nil {
+					log.Warnf("ReportConsensusFault replace message failed: error:%s", err)
+				}
+			}()
+		}
+	}
+
+	for {
+		head, err := a.ChainHead(ctx)
+		if err != nil {
+			return err
+		}
+		if head.Height() > slashHeight {
+			break
+		}
+		time.Sleep(time.Second * 1)
+	}
 
 	return nil
 }

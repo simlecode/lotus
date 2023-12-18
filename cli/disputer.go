@@ -2,7 +2,11 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strconv"
 	"time"
 
@@ -11,8 +15,10 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/crypto"
 	builtin3 "github.com/filecoin-project/specs-actors/v3/actors/builtin"
 	miner3 "github.com/filecoin-project/specs-actors/v3/actors/builtin/miner"
 
@@ -131,6 +137,91 @@ var disputerMsgCmd = &cli.Command{
 	},
 }
 
+func loadMinerFromFile(ctx context.Context, path string) ([]address.Address, int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, 0, nil
+		}
+		return nil, 0, err
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, 0, err
+	}
+	var addrs []address.Address
+	if err := json.Unmarshal(data, &addrs); err != nil {
+		return nil, 0, err
+	}
+
+	var max int
+	for _, addr := range addrs {
+		idStr := addr.String()[2:]
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			return nil, 0, err
+		}
+		if max < id {
+			max = id
+		}
+	}
+
+	log.Info("load local miners", len(addrs), "max", max)
+	return addrs, max, nil
+}
+
+func loadMiners(ctx context.Context, api v0api.FullNode, path string) ([]address.Address, error) {
+	var maddrs []address.Address
+	start := 1000
+	localMiners, max, err := loadMinerFromFile(ctx, path)
+	if err == nil && start < max {
+		start = max
+		maddrs = localMiners
+	}
+
+	getActorFailedCount := 0
+	for ; start < 2990000; start++ {
+		if getActorFailedCount > 20 && max > 1000 && start > 2880000 {
+			log.Infof("break at: %d", start)
+			break
+		}
+		addr, err := address.NewIDAddress(uint64(start))
+		if err != nil {
+			return nil, err
+		}
+		actor, err := api.StateGetActor(ctx, addr, types.EmptyTSK)
+		if err != nil {
+			getActorFailedCount++
+			continue
+		}
+
+		if actor.Code.String() != "bafk2bzacedo75pabe4i2l3hvhtsjmijrcytd2y76xwe573uku25fi7sugqld6" {
+			continue
+		}
+
+		pow, err := api.StateMinerPower(ctx, addr, types.EmptyTSK)
+		if err != nil {
+			continue
+		}
+		if pow.MinerPower.QualityAdjPower.Int64() > 0 || pow.MinerPower.RawBytePower.Int64() > 0 {
+			maddrs = append(maddrs, addr)
+		}
+
+		getActorFailedCount = 0
+
+		if start%10000 == 0 {
+			fmt.Printf("i %d, found %d miners\n", start, len(maddrs))
+		}
+	}
+
+	data, err := json.Marshal(maddrs)
+	if err == nil {
+		_ = os.WriteFile(path, data, 0644)
+	}
+
+	return maddrs, nil
+}
+
 var disputerStartCmd = &cli.Command{
 	Name:      "start",
 	Usage:     "Start the window post disputer",
@@ -140,24 +231,61 @@ var disputerStartCmd = &cli.Command{
 			Name:  "start-epoch",
 			Usage: "only start disputing PoSts after this epoch ",
 		},
+		&cli.StringFlag{
+			Name:  "miner-file",
+			Value: "./miners.json",
+			Usage: "path to miner file",
+		},
+		lotusURLFlag,
+		lotusTokenFlag,
+		WalletURLFlag,
+		WalletTokenFlag,
+		gasOverPremiumFlag,
 	},
 	Action: func(cctx *cli.Context) error {
-		api, closer, err := GetFullNodeAPI(cctx)
+		api, fclose, err := NewLotusFullNodeRPCFromContext(cctx)
 		if err != nil {
 			return err
 		}
-		defer closer()
+		defer fclose()
+
+		var wapi v0api.Wallet
+		var wclose jsonrpc.ClientCloser
+		if cctx.IsSet(WalletURLFlag.Name) {
+			wapi, wclose, err = NewWalletFullRPCFromContext(cctx)
+			if err != nil {
+				return err
+			}
+			defer wclose()
+		}
+
+		// api, closer, err := GetFullNodeAPI(cctx)
+		// if err != nil {
+		// 	return err
+		// }
+		// defer closer()
 
 		ctx := ReqContext(cctx)
 
-		fromAddr, err := getSender(ctx, api, cctx.String("from"))
+		// fromAddr, err := getSender(ctx, api, cctx.String("from"))
+		fromAddr, err := address.NewFromString(cctx.String("from"))
 		if err != nil {
 			return err
 		}
+		gasOverPremium := cctx.Int("gas-over-premium")
 
-		mss, err := getMaxFee(cctx.String("max-fee"))
-		if err != nil {
-			return err
+		// mss, err := getMaxFee(cctx.String("max-fee"))
+		// if err != nil {
+		// 	return err
+		// }
+
+		var minerList []address.Address
+		minerFile := cctx.String("miner-file")
+		if len(minerFile) > 0 {
+			minerList, err = loadMiners(ctx, api, minerFile)
+			if err != nil {
+				return err
+			}
 		}
 
 		startEpoch := abi.ChainEpoch(0)
@@ -198,10 +326,10 @@ var disputerStartCmd = &cli.Command{
 
 		// build initial deadlineMap
 
-		minerList, err := api.StateListMiners(ctx, types.EmptyTSK)
-		if err != nil {
-			return err
-		}
+		// minerList, err := api.StateListMiners(ctx, types.EmptyTSK)
+		// if err != nil {
+		// 	return err
+		// }
 
 		knownMiners := make(map[address.Address]struct{})
 		deadlineMap := make(map[abi.ChainEpoch][]minerDeadline)
@@ -270,11 +398,23 @@ var disputerStartCmd = &cli.Command{
 			// TODO: Parallelizeable / can be integrated into the previous deadline-iterating for loop
 			for _, dpmsg := range dpmsgs {
 				disputeLog.Infow("disputing a PoSt", "miner", dpmsg.To)
-				m, err := api.MpoolPushMessage(ctx, dpmsg, mss)
+				// m, err := api.MpoolPushMessage(ctx, dpmsg, mss)
+				if wapi == nil {
+					signedMsg, err := SignAndPushMessage(ctx, api, func(ctx context.Context, signer address.Address, toSign []byte, meta lapi.MsgMeta) (*crypto.Signature, error) {
+						return api.WalletSign(ctx, signer, toSign)
+					}, dpmsg, gasOverPremium)
+					if err != nil {
+						disputeLog.Errorw("failed to dispute post message", "err", err.Error(), "miner", dpmsg.To)
+					} else {
+						disputeLog.Infow("submited dispute", "mcid", signedMsg.Cid(), "miner", dpmsg.To)
+					}
+					continue
+				}
+				signedMsg, err := SignAndPushMessage(ctx, api, wapi.WalletSign, dpmsg, gasOverPremium)
 				if err != nil {
 					disputeLog.Errorw("failed to dispute post message", "err", err.Error(), "miner", dpmsg.To)
 				} else {
-					disputeLog.Infow("submited dispute", "mcid", m.Cid(), "miner", dpmsg.To)
+					disputeLog.Infow("submited dispute", "mcid", signedMsg.Cid(), "miner", dpmsg.To)
 				}
 			}
 
@@ -306,7 +446,11 @@ var disputerStartCmd = &cli.Command{
 			case <-statusCheckTicker.C:
 				disputeLog.Infof("running status check")
 
-				minerList, err = api.StateListMiners(ctx, types.EmptyTSK)
+				// minerList, err = api.StateListMiners(ctx, types.EmptyTSK)
+				// if err != nil {
+				// 	return xerrors.Errorf("getting miner list: %w", err)
+				// }
+				minerList, err = loadMiners(ctx, api, minerFile)
 				if err != nil {
 					return xerrors.Errorf("getting miner list: %w", err)
 				}
@@ -433,9 +577,12 @@ func getMaxFee(maxStr string) (*lapi.MessageSendSpec, error) {
 			return nil, xerrors.Errorf("parsing max-fee: %w", err)
 		}
 		return &lapi.MessageSendSpec{
-			MaxFee: types.BigInt(maxFee),
+			MaxFee:         types.BigInt(maxFee),
+			GasOverPremium: 5,
 		}, nil
 	}
 
-	return nil, nil
+	return &lapi.MessageSendSpec{
+		GasOverPremium: 5,
+	}, nil
 }

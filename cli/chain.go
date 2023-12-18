@@ -65,6 +65,7 @@ var ChainCmd = &cli.Command{
 		ChainEncodeCmd,
 		ChainDisputeSetCmd,
 		ChainPruneCmd,
+		reportSlashCmd,
 	},
 }
 
